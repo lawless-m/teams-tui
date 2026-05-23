@@ -198,6 +198,7 @@ async fn run() -> Result<()> {
     }
 
     println!("teams-tui ready — following {n_chats} chats and {n_channels} channels");
+    handle_chats_list(&stream, &follow);
 
     let poll_msg_handle = {
         let graph = graph.clone();
@@ -243,6 +244,8 @@ async fn run() -> Result<()> {
     .await;
 
     shutdown.store(true, Ordering::Relaxed);
+    poll_msg_handle.abort();
+    poll_disc_handle.abort();
     let _ = poll_msg_handle.await;
     let _ = poll_disc_handle.await;
 
