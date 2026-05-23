@@ -78,8 +78,6 @@ Save as `~/.cargo/bin/teams-tui-term`, `chmod +x`, and invoke that from dmenu.
 
 ## Limitations
 
-- **Chat polling is not delta.** Microsoft Graph does not support change tracking on `chatMessage` for individual chats (only for channel messages). We poll `/chats/{id}/messages?$filter=lastModifiedDateTime gt {since}` every 5 seconds. Bootstrap window is the last 24 hours.
-- **No backfill.** Bootstrap messages are silently discarded; only fresh ones reach the pane.
 - **Reply-anchored input.** Every send must point at a known conversation, either by tagged message or by `/chats` + `/<TAG>`.
 - **No `/help`, `/ignore`, `/join`, `/watch`.** Configuration changes require editing the TOML and restarting.
 - **Max 26 followed chats taggable.** Extras get no `/<TAG>` slot until a tag frees up.
