@@ -1,0 +1,21 @@
+[package]
+name = "teams-tui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+directories = "5"
+ego-tree = "0.6"
+notify-rust = "4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rustyline = "14"
+scraper = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "fs", "sync", "net"] }
+toml = "0.8"
+
+[dev-dependencies]
+wiremock = "0.6"
