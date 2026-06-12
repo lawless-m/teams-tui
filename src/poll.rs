@@ -186,6 +186,18 @@ fn iso_time_to_hhmm(iso: &str) -> String {
         .unwrap_or_else(|_| "--:--".to_string())
 }
 
+// The chat messages endpoint returns newest-first; sort so display order is chronological.
+fn sort_oldest_first(messages: &mut [GraphMessage]) {
+    messages.sort_by(|a, b| {
+        let key = |m: &GraphMessage| {
+            m.created_date_time
+                .clone()
+                .or_else(|| m.last_modified_date_time.clone())
+        };
+        key(a).cmp(&key(b))
+    });
+}
+
 fn graph_message_to_event(
     msg: GraphMessage,
     conversation_key: ConversationKey,
@@ -287,6 +299,7 @@ async fn poll_chat_once(
         .unwrap_or(request_start);
 
     if !is_bootstrap {
+        sort_oldest_first(&mut messages);
         for msg in messages {
             if let Some(event) = graph_message_to_event(msg, key.clone(), conv.clone(), self_id) {
                 dispatch(stream, event, &conv, self_id, handlers);
@@ -329,6 +342,7 @@ async fn poll_channel_once(
     }
 
     if !is_bootstrap {
+        sort_oldest_first(&mut messages);
         for msg in messages {
             if let Some(event) = graph_message_to_event(msg, key.clone(), conv.clone(), self_id) {
                 dispatch(stream, event, &conv, self_id, handlers);
@@ -671,4 +685,95 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmpdir);
     }
 
+    #[tokio::test]
+    async fn tick_prints_messages_oldest_first() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/chats/chat1/messages/delta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [
+                    {
+                        "id": "m2",
+                        "messageType": "message",
+                        "from": {"user": {"id": "alice", "displayName": "Alice"}},
+                        "body": {"contentType": "html", "content": "<p>newer</p>"},
+                        "createdDateTime": "2021-01-01T12:05:00Z"
+                    },
+                    {
+                        "id": "m1",
+                        "messageType": "message",
+                        "from": {"user": {"id": "alice", "displayName": "Alice"}},
+                        "body": {"contentType": "html", "content": "<p>older</p>"},
+                        "createdDateTime": "2021-01-01T12:00:00Z"
+                    }
+                ],
+                "@odata.deltaLink": "https://graph.example/delta-next"
+            })))
+            .mount(&server)
+            .await;
+
+        let tokens = Arc::new(TokioMutex::new(Tokens {
+            access_token: "a".into(),
+            refresh_token: "r".into(),
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+        }));
+        let graph = GraphClient::new(
+            tokens,
+            server.uri(),
+            format!("{}/oauth2/v2.0/token", server.uri()),
+            "client".into(),
+        );
+
+        let sink = Arc::new(StdMutex::new(Vec::new()));
+        let printer: Arc<dyn LinePrinter> = Arc::new(CapturePrinter(sink.clone()));
+        let stream = Stream::new(printer, "self".into(), Arc::new(|| 200));
+
+        let mut state = FollowState::default();
+        state.chats.insert(
+            "chat1".into(),
+            ChatFollowInfo {
+                id: "chat1".into(),
+                topic: None,
+                chat_type: "oneOnOne".into(),
+                member_names: vec![],
+                cursor: Some(format!(
+                    "{}/chats/chat1/messages/delta?$deltatoken=prev",
+                    server.uri()
+                )),
+            },
+        );
+        let follow = Arc::new(StdMutex::new(state));
+
+        let tmpdir = std::env::temp_dir().join(format!(
+            "teams-tui-poll-order-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cursors_path = tmpdir.join("cursors.json");
+
+        let mut health = PollHealth::new();
+        let ok = message_poll_tick(
+            &graph,
+            &follow,
+            &stream,
+            "self",
+            &cursors_path,
+            None,
+            &mut health,
+        )
+        .await;
+        assert!(ok, "tick should succeed");
+
+        let lines = sink.lock().unwrap().clone();
+        assert_eq!(lines.len(), 2, "expected two printed lines, got {lines:?}");
+        assert!(
+            lines[0].contains("older"),
+            "oldest message should print first, got {lines:?}"
+        );
+        assert!(lines[1].contains("newer"));
+
+        let _ = std::fs::remove_dir_all(&tmpdir);
+    }
 }
