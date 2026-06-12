@@ -186,22 +186,17 @@ pub fn channel_to_conversation(ch: &ChannelFollowInfo) -> Conversation {
     }
 }
 
-fn iso_time_to_hhmm(iso: &str) -> String {
-    DateTime::parse_from_rfc3339(iso)
-        .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
-        .unwrap_or_else(|_| "--:--".to_string())
+fn message_timestamp(m: &GraphMessage) -> Option<DateTime<chrono::Utc>> {
+    m.created_date_time
+        .as_deref()
+        .or(m.last_modified_date_time.as_deref())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
-// The chat messages endpoint returns newest-first; sort so display order is chronological.
+// The messages endpoints only support newest-first; sort so display order is chronological.
 fn sort_oldest_first(messages: &mut [GraphMessage]) {
-    messages.sort_by(|a, b| {
-        let key = |m: &GraphMessage| {
-            m.created_date_time
-                .clone()
-                .or_else(|| m.last_modified_date_time.clone())
-        };
-        key(a).cmp(&key(b))
-    });
+    messages.sort_by_key(|m| message_timestamp(m).unwrap_or(DateTime::<chrono::Utc>::MAX_UTC));
 }
 
 fn graph_message_to_event(
@@ -229,11 +224,8 @@ fn graph_message_to_event(
         (String::new(), "(unknown)".to_string())
     };
 
-    let time_hhmm = msg
-        .last_modified_date_time
-        .as_deref()
-        .or(msg.created_date_time.as_deref())
-        .map(iso_time_to_hhmm)
+    let time_hhmm = message_timestamp(&msg)
+        .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
         .unwrap_or_else(|| "--:--".to_string());
 
     let body_html = msg
@@ -293,6 +285,7 @@ async fn poll_chat_once(
         break;
     }
 
+    // The cursor must advance by lastModifiedDateTime to match the delta filter.
     let new_cursor = messages
         .iter()
         .filter_map(|m| {
