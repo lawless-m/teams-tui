@@ -16,6 +16,7 @@ use crate::auth::{self, Tokens};
 #[derive(Debug)]
 pub enum GraphError {
     CursorExpired,
+    TransientUpstream(u16, String),
     Other(anyhow::Error),
 }
 
@@ -23,6 +24,9 @@ impl std::fmt::Display for GraphError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             GraphError::CursorExpired => write!(f, "delta cursor expired (410 Gone)"),
+            GraphError::TransientUpstream(code, msg) => {
+                write!(f, "graph error {code}: {msg}")
+            }
             GraphError::Other(e) => std::fmt::Display::fmt(e, f),
         }
     }
@@ -118,6 +122,13 @@ impl GraphClient {
                     continue;
                 }
                 StatusCode::GONE => return Err(GraphError::CursorExpired),
+                StatusCode::BAD_GATEWAY
+                | StatusCode::SERVICE_UNAVAILABLE
+                | StatusCode::GATEWAY_TIMEOUT => {
+                    let code = status.as_u16();
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(GraphError::TransientUpstream(code, text));
+                }
                 s => {
                     let text = resp.text().await.unwrap_or_default();
                     return Err(GraphError::Other(anyhow!("graph error {s}: {text}")));

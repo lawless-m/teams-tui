@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::DateTime;
 
@@ -21,8 +21,37 @@ pub struct PostHandlers {
     pub counters: StatusCounters,
 }
 
-pub const MESSAGE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+pub const MESSAGE_POLL_INTERVAL: Duration = Duration::from_secs(15);
 pub const DISCOVERY_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+const TRANSIENT_DROUGHT: Duration = Duration::from_secs(60);
+
+#[derive(Debug)]
+pub struct PollHealth {
+    last_non_transient: Instant,
+}
+
+impl PollHealth {
+    pub fn new() -> Self {
+        Self {
+            last_non_transient: Instant::now(),
+        }
+    }
+
+    pub fn mark_non_transient(&mut self) {
+        self.last_non_transient = Instant::now();
+    }
+
+    pub fn is_drought(&self) -> bool {
+        Instant::now().duration_since(self.last_non_transient) > TRANSIENT_DROUGHT
+    }
+}
+
+impl Default for PollHealth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ChatFollowInfo {
@@ -345,6 +374,7 @@ pub async fn message_poll_tick(
     self_id: &str,
     cursors_path: &Path,
     handlers: Option<&PostHandlers>,
+    health: &mut PollHealth,
 ) -> bool {
     let mut any_error = false;
 
@@ -355,6 +385,7 @@ pub async fn message_poll_tick(
     for chat in &chat_list {
         match poll_chat_once(graph, chat, stream, self_id, handlers).await {
             Ok(new_cursor) => {
+                health.mark_non_transient();
                 if let Some(nc) = new_cursor {
                     let mut state = follow.lock().unwrap();
                     if let Some(c) = state.chats.get_mut(&chat.id) {
@@ -363,12 +394,20 @@ pub async fn message_poll_tick(
                 }
             }
             Err(GraphError::CursorExpired) => {
+                health.mark_non_transient();
                 let mut state = follow.lock().unwrap();
                 if let Some(c) = state.chats.get_mut(&chat.id) {
                     c.cursor = None;
                 }
             }
+            Err(GraphError::TransientUpstream(code, msg)) => {
+                if health.is_drought() {
+                    eprintln!("chat poll {code} drought {}: {msg}", chat.id);
+                    any_error = true;
+                }
+            }
             Err(e) => {
+                health.mark_non_transient();
                 eprintln!("chat poll error {}: {e}", chat.id);
                 any_error = true;
             }
@@ -383,6 +422,7 @@ pub async fn message_poll_tick(
         let key = (ch.team_id.clone(), ch.channel_id.clone());
         match poll_channel_once(graph, ch, stream, self_id, handlers).await {
             Ok(new_cursor) => {
+                health.mark_non_transient();
                 if let Some(nc) = new_cursor {
                     let mut state = follow.lock().unwrap();
                     if let Some(c) = state.channels.get_mut(&key) {
@@ -391,12 +431,23 @@ pub async fn message_poll_tick(
                 }
             }
             Err(GraphError::CursorExpired) => {
+                health.mark_non_transient();
                 let mut state = follow.lock().unwrap();
                 if let Some(c) = state.channels.get_mut(&key) {
                     c.cursor = None;
                 }
             }
+            Err(GraphError::TransientUpstream(code, msg)) => {
+                if health.is_drought() {
+                    eprintln!(
+                        "channel poll {code} drought {}/{}: {msg}",
+                        ch.team_id, ch.channel_id
+                    );
+                    any_error = true;
+                }
+            }
             Err(e) => {
+                health.mark_non_transient();
                 eprintln!("channel poll error {}/{}: {e}", ch.team_id, ch.channel_id);
                 any_error = true;
             }
@@ -423,6 +474,7 @@ pub async fn run_message_poll(
     shutdown: Arc<AtomicBool>,
 ) {
     let mut backoff_secs: u64 = 0;
+    let mut health = PollHealth::new();
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return;
@@ -435,6 +487,7 @@ pub async fn run_message_poll(
             &self_id,
             &cursors_path,
             handlers.as_deref(),
+            &mut health,
         )
         .await;
 
@@ -464,6 +517,7 @@ pub async fn run_discovery_poll(
     follow: Arc<StdMutex<FollowState>>,
     shutdown: Arc<AtomicBool>,
 ) {
+    let mut health = PollHealth::new();
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return;
@@ -471,6 +525,7 @@ pub async fn run_discovery_poll(
 
         match graph.list_chats().await {
             Ok(chats) => {
+                health.mark_non_transient();
                 let mut state = follow.lock().unwrap();
                 for chat in chats {
                     state
@@ -489,7 +544,13 @@ pub async fn run_discovery_poll(
                         });
                 }
             }
+            Err(GraphError::TransientUpstream(code, msg)) => {
+                if health.is_drought() {
+                    eprintln!("discovery {code} drought: {msg}");
+                }
+            }
             Err(e) => {
+                health.mark_non_transient();
                 eprintln!("discovery error: {e}");
             }
         }
@@ -578,7 +639,17 @@ mod tests {
         ));
         let cursors_path = tmpdir.join("cursors.json");
 
-        let ok = message_poll_tick(&graph, &follow, &stream, "self", &cursors_path, None).await;
+        let mut health = PollHealth::new();
+        let ok = message_poll_tick(
+            &graph,
+            &follow,
+            &stream,
+            "self",
+            &cursors_path,
+            None,
+            &mut health,
+        )
+        .await;
         assert!(ok, "tick should succeed");
 
         let lines = sink.lock().unwrap().clone();
@@ -599,4 +670,5 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmpdir);
     }
+
 }
