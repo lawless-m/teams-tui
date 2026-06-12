@@ -102,8 +102,7 @@ pub fn format_message(
     width: usize,
 ) -> String {
     let leader = format!("{time_hhmm} {prefix}:{sender}: [{tag}] ");
-    let indent = " ".repeat(leader.chars().count());
-    hard_wrap(content, &leader, &indent, width)
+    hard_wrap(content, &leader, "        ", width)
 }
 
 pub fn html_to_text(html: &str, self_id: &str) -> (String, bool) {
@@ -113,10 +112,17 @@ pub fn html_to_text(html: &str, self_id: &str) -> (String, bool) {
     for child in doc.tree.root().children() {
         render_node(child, self_id, &mut out, &mut mention);
     }
-    while out.ends_with('\n') || out.ends_with(' ') {
-        out.pop();
+    let mut lines: Vec<String> = out
+        .split('\n')
+        .map(|l| {
+            l.trim_end_matches(|c: char| c.is_whitespace())
+                .to_string()
+        })
+        .collect();
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
     }
-    (out, mention)
+    (lines.join("\n"), mention)
 }
 
 fn render_node(
@@ -375,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn format_message_wraps_content_under_leader() {
+    fn format_message_wraps_content_with_fixed_indent() {
         let s = format_message(
             "10:30",
             "#chan",
@@ -384,29 +390,36 @@ mod tests {
             "hello world!",
             30,
         );
-        let leader_len = "10:30 #chan:alice: [a] ".chars().count();
-        assert_eq!(leader_len, 23);
+        let leader = "10:30 #chan:alice: [a] ";
         let lines: Vec<&str> = s.lines().collect();
-        assert!(lines[0].starts_with("10:30 #chan:alice: [a] "));
+        assert!(lines[0].starts_with(leader));
         for l in &lines[1..] {
             assert!(
-                l.starts_with(&" ".repeat(leader_len)),
-                "continuation line not indented: {l:?}"
+                l.starts_with("        ") && !l.starts_with("         "),
+                "continuation line not indented with eight spaces: {l:?}"
             );
         }
-        let joined: String = lines
-            .iter()
-            .enumerate()
-            .map(|(i, l)| {
-                if i == 0 {
-                    &l[leader_len..]
-                } else {
-                    &l[leader_len..]
-                }
-            })
-            .collect::<Vec<_>>()
-            .concat();
+        let mut joined = String::new();
+        joined.push_str(&lines[0][leader.len()..]);
+        for l in &lines[1..] {
+            joined.push_str(&l[8..]);
+        }
         assert_eq!(joined, "hello world!");
+    }
+
+    #[test]
+    fn trailing_empty_paragraph_with_nbsp_is_stripped() {
+        let (text, _) = html_to_text(
+            "<p>Claude generated doc incoming 😄</p><p>&nbsp;</p>",
+            "self",
+        );
+        assert_eq!(text, "Claude generated doc incoming 😄");
+    }
+
+    #[test]
+    fn trailing_whitespace_only_line_is_stripped() {
+        let (text, _) = html_to_text("<p>hello</p><p>   </p>", "self");
+        assert_eq!(text, "hello");
     }
 
     #[test]
