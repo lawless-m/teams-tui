@@ -601,23 +601,16 @@ mod tests {
         assert!(!h.transient("chat-bad"), "success resets the streak");
     }
 
-    #[tokio::test]
-    async fn tick_fetches_feeds_stream_and_saves_cursor() {
+    /// Runs one message_poll_tick against a mock chat1 delta endpoint returning
+    /// `body`, and returns the printed lines, follow state, and cursors path.
+    async fn run_tick_with_response(
+        tag: &str,
+        body: serde_json::Value,
+    ) -> (Vec<String>, Arc<StdMutex<FollowState>>, PathBuf) {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/chats/chat1/messages/delta"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "value": [
-                    {
-                        "id": "m1",
-                        "messageType": "message",
-                        "from": {"user": {"id": "alice", "displayName": "Alice"}},
-                        "body": {"contentType": "html", "content": "<p>hello world</p>"},
-                        "createdDateTime": "2021-01-01T12:00:00Z"
-                    }
-                ],
-                "@odata.deltaLink": "https://graph.example/delta-next"
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
             .mount(&server)
             .await;
 
@@ -654,7 +647,7 @@ mod tests {
         let follow = Arc::new(StdMutex::new(state));
 
         let tmpdir = std::env::temp_dir().join(format!(
-            "teams-tui-poll-{}",
+            "teams-tui-poll-{tag}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -676,6 +669,28 @@ mod tests {
         assert!(ok, "tick should succeed");
 
         let lines = sink.lock().unwrap().clone();
+        (lines, follow, cursors_path)
+    }
+
+    #[tokio::test]
+    async fn tick_fetches_feeds_stream_and_saves_cursor() {
+        let (lines, follow, cursors_path) = run_tick_with_response(
+            "basic",
+            json!({
+                "value": [
+                    {
+                        "id": "m1",
+                        "messageType": "message",
+                        "from": {"user": {"id": "alice", "displayName": "Alice"}},
+                        "body": {"contentType": "html", "content": "<p>hello world</p>"},
+                        "createdDateTime": "2021-01-01T12:00:00Z"
+                    }
+                ],
+                "@odata.deltaLink": "https://graph.example/delta-next"
+            }),
+        )
+        .await;
+
         assert_eq!(lines.len(), 1, "expected one printed line, got {lines:?}");
         assert!(lines[0].contains("hello world"));
         assert!(lines[0].contains("Alice"));
@@ -691,15 +706,14 @@ mod tests {
         let loaded = Cursors::load_from(&cursors_path).unwrap();
         assert_eq!(loaded.entries.len(), 1);
 
-        let _ = std::fs::remove_dir_all(&tmpdir);
+        let _ = std::fs::remove_dir_all(cursors_path.parent().unwrap());
     }
 
     #[tokio::test]
     async fn tick_prints_messages_oldest_first() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/chats/chat1/messages/delta"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        let (lines, _follow, cursors_path) = run_tick_with_response(
+            "order",
+            json!({
                 "value": [
                     {
                         "id": "m2",
@@ -717,65 +731,10 @@ mod tests {
                     }
                 ],
                 "@odata.deltaLink": "https://graph.example/delta-next"
-            })))
-            .mount(&server)
-            .await;
-
-        let tokens = Arc::new(TokioMutex::new(Tokens {
-            access_token: "a".into(),
-            refresh_token: "r".into(),
-            expires_at: Utc::now() + chrono::Duration::hours(1),
-        }));
-        let graph = GraphClient::new(
-            tokens,
-            server.uri(),
-            format!("{}/oauth2/v2.0/token", server.uri()),
-            "client".into(),
-        );
-
-        let sink = Arc::new(StdMutex::new(Vec::new()));
-        let printer: Arc<dyn LinePrinter> = Arc::new(CapturePrinter(sink.clone()));
-        let stream = Stream::new(printer, "self".into(), Arc::new(|| 200));
-
-        let mut state = FollowState::default();
-        state.chats.insert(
-            "chat1".into(),
-            ChatFollowInfo {
-                id: "chat1".into(),
-                topic: None,
-                chat_type: "oneOnOne".into(),
-                member_names: vec![],
-                cursor: Some(format!(
-                    "{}/chats/chat1/messages/delta?$deltatoken=prev",
-                    server.uri()
-                )),
-            },
-        );
-        let follow = Arc::new(StdMutex::new(state));
-
-        let tmpdir = std::env::temp_dir().join(format!(
-            "teams-tui-poll-order-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let cursors_path = tmpdir.join("cursors.json");
-
-        let mut health = PollHealth::new();
-        let ok = message_poll_tick(
-            &graph,
-            &follow,
-            &stream,
-            "self",
-            &cursors_path,
-            None,
-            &mut health,
+            }),
         )
         .await;
-        assert!(ok, "tick should succeed");
 
-        let lines = sink.lock().unwrap().clone();
         assert_eq!(lines.len(), 2, "expected two printed lines, got {lines:?}");
         assert!(
             lines[0].contains("older"),
@@ -783,6 +742,6 @@ mod tests {
         );
         assert!(lines[1].contains("newer"));
 
-        let _ = std::fs::remove_dir_all(&tmpdir);
+        let _ = std::fs::remove_dir_all(cursors_path.parent().unwrap());
     }
 }
