@@ -1,4 +1,4 @@
-//! The two polling loops: 5s message delta, 30s chat discovery.
+//! The two polling loops: 15s message delta, 30s chat discovery.
 
 #![allow(dead_code)]
 
@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::DateTime;
 
@@ -24,26 +24,32 @@ pub struct PostHandlers {
 pub const MESSAGE_POLL_INTERVAL: Duration = Duration::from_secs(15);
 pub const DISCOVERY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-const TRANSIENT_DROUGHT: Duration = Duration::from_secs(60);
+// Consecutive transient failures of one resource before we report it and back
+// off (~1 minute at the 15s message interval).
+const TRANSIENT_REPORT_AFTER: u32 = 4;
 
 #[derive(Debug)]
 pub struct PollHealth {
-    last_non_transient: Instant,
+    transient_failures: HashMap<String, u32>,
 }
 
 impl PollHealth {
     pub fn new() -> Self {
         Self {
-            last_non_transient: Instant::now(),
+            transient_failures: HashMap::new(),
         }
     }
 
-    pub fn mark_non_transient(&mut self) {
-        self.last_non_transient = Instant::now();
+    pub fn ok(&mut self, key: &str) {
+        self.transient_failures.remove(key);
     }
 
-    pub fn is_drought(&self) -> bool {
-        Instant::now().duration_since(self.last_non_transient) > TRANSIENT_DROUGHT
+    /// Records a transient failure; true once this resource has failed enough
+    /// consecutive polls to be worth reporting.
+    pub fn transient(&mut self, key: &str) -> bool {
+        let n = self.transient_failures.entry(key.to_string()).or_insert(0);
+        *n += 1;
+        *n >= TRANSIENT_REPORT_AFTER
     }
 }
 
@@ -399,7 +405,7 @@ pub async fn message_poll_tick(
     for chat in &chat_list {
         match poll_chat_once(graph, chat, stream, self_id, handlers).await {
             Ok(new_cursor) => {
-                health.mark_non_transient();
+                health.ok(&chat.id);
                 if let Some(nc) = new_cursor {
                     let mut state = follow.lock().unwrap();
                     if let Some(c) = state.chats.get_mut(&chat.id) {
@@ -408,20 +414,20 @@ pub async fn message_poll_tick(
                 }
             }
             Err(GraphError::CursorExpired) => {
-                health.mark_non_transient();
+                health.ok(&chat.id);
                 let mut state = follow.lock().unwrap();
                 if let Some(c) = state.chats.get_mut(&chat.id) {
                     c.cursor = None;
                 }
             }
             Err(GraphError::TransientUpstream(code, msg)) => {
-                if health.is_drought() {
-                    eprintln!("chat poll {code} drought {}: {msg}", chat.id);
+                if health.transient(&chat.id) {
+                    eprintln!("chat poll {code} still failing {}: {msg}", chat.id);
                     any_error = true;
                 }
             }
             Err(e) => {
-                health.mark_non_transient();
+                health.ok(&chat.id);
                 eprintln!("chat poll error {}: {e}", chat.id);
                 any_error = true;
             }
@@ -434,9 +440,10 @@ pub async fn message_poll_tick(
 
     for ch in &channel_list {
         let key = (ch.team_id.clone(), ch.channel_id.clone());
+        let hkey = format!("{}/{}", ch.team_id, ch.channel_id);
         match poll_channel_once(graph, ch, stream, self_id, handlers).await {
             Ok(new_cursor) => {
-                health.mark_non_transient();
+                health.ok(&hkey);
                 if let Some(nc) = new_cursor {
                     let mut state = follow.lock().unwrap();
                     if let Some(c) = state.channels.get_mut(&key) {
@@ -445,24 +452,21 @@ pub async fn message_poll_tick(
                 }
             }
             Err(GraphError::CursorExpired) => {
-                health.mark_non_transient();
+                health.ok(&hkey);
                 let mut state = follow.lock().unwrap();
                 if let Some(c) = state.channels.get_mut(&key) {
                     c.cursor = None;
                 }
             }
             Err(GraphError::TransientUpstream(code, msg)) => {
-                if health.is_drought() {
-                    eprintln!(
-                        "channel poll {code} drought {}/{}: {msg}",
-                        ch.team_id, ch.channel_id
-                    );
+                if health.transient(&hkey) {
+                    eprintln!("channel poll {code} still failing {hkey}: {msg}");
                     any_error = true;
                 }
             }
             Err(e) => {
-                health.mark_non_transient();
-                eprintln!("channel poll error {}/{}: {e}", ch.team_id, ch.channel_id);
+                health.ok(&hkey);
+                eprintln!("channel poll error {hkey}: {e}");
                 any_error = true;
             }
         }
@@ -539,7 +543,7 @@ pub async fn run_discovery_poll(
 
         match graph.list_chats().await {
             Ok(chats) => {
-                health.mark_non_transient();
+                health.ok("discovery");
                 let mut state = follow.lock().unwrap();
                 for chat in chats {
                     state
@@ -559,12 +563,12 @@ pub async fn run_discovery_poll(
                 }
             }
             Err(GraphError::TransientUpstream(code, msg)) => {
-                if health.is_drought() {
-                    eprintln!("discovery {code} drought: {msg}");
+                if health.transient("discovery") {
+                    eprintln!("discovery {code} still failing: {msg}");
                 }
             }
             Err(e) => {
-                health.mark_non_transient();
+                health.ok("discovery");
                 eprintln!("discovery error: {e}");
             }
         }
@@ -590,6 +594,18 @@ mod tests {
         fn print_line(&self, line: &str) {
             self.0.lock().unwrap().push(line.to_string());
         }
+    }
+
+    #[test]
+    fn transient_failures_tracked_per_resource() {
+        let mut h = PollHealth::new();
+        for _ in 0..3 {
+            assert!(!h.transient("chat-bad"), "below threshold, not reported");
+            h.ok("chat-good");
+        }
+        assert!(h.transient("chat-bad"), "4th consecutive failure reported");
+        h.ok("chat-bad");
+        assert!(!h.transient("chat-bad"), "success resets the streak");
     }
 
     #[tokio::test]
