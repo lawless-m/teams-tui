@@ -112,13 +112,7 @@ pub fn html_to_text(html: &str, self_id: &str) -> (String, bool) {
     for child in doc.tree.root().children() {
         render_node(child, self_id, &mut out, &mut mention);
     }
-    let mut lines: Vec<String> = out
-        .split('\n')
-        .map(|l| {
-            l.trim_end_matches(|c: char| c.is_whitespace())
-                .to_string()
-        })
-        .collect();
+    let mut lines: Vec<&str> = out.split('\n').map(str::trim_end).collect();
     while lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
     }
