@@ -2159,6 +2159,7 @@ dependencies = [
  "directories",
  "ego-tree",
  "notify-rust",
+ "regex",
  "reqwest",
  "rustyline",
  "scraper",

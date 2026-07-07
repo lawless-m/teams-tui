@@ -1,6 +1,7 @@
 //! teams-tui — minimal terminal Teams client. See plan-docs/SPEC.md.
 
 mod auth;
+mod bot;
 mod config;
 mod cursors;
 mod graph;
@@ -25,8 +26,8 @@ use cursors::{ConversationKey, Cursors};
 use graph::GraphClient;
 use notify::{Notifier, StatusCounters};
 use poll::{
-    ChannelFollowInfo, ChatFollowInfo, FollowState, PostHandlers, chat_to_conversation,
-    channel_to_conversation, run_discovery_poll, run_message_poll,
+    ChannelFollowInfo, ChatFollowInfo, FollowState, PostHandlers, channel_to_conversation,
+    chat_to_conversation, run_discovery_poll, run_message_poll,
 };
 use stream::{LinePrinter, Stream};
 use tags::parse_reply;
@@ -112,13 +113,16 @@ async fn run() -> Result<()> {
                 .team_channels(&team.id)
                 .await
                 .map_err(|e| anyhow::anyhow!("channels for '{}' failed: {e}", team.display_name))?;
-            let ch = chans.iter().find(|c| c.display_name == fc.channel).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "config: channel '{}' not found in team '{}'",
-                    fc.channel,
-                    fc.team
-                )
-            })?;
+            let ch = chans
+                .iter()
+                .find(|c| c.display_name == fc.channel)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "config: channel '{}' not found in team '{}'",
+                        fc.channel,
+                        fc.team
+                    )
+                })?;
             channels.insert(
                 (team.id.clone(), ch.id.clone()),
                 ChannelFollowInfo {
@@ -182,11 +186,26 @@ async fn run() -> Result<()> {
     let width_fn: Arc<dyn Fn() -> usize + Send + Sync> = Arc::new(|| 80);
     let stream = Arc::new(Stream::new(printer, self_id.clone(), width_fn));
 
+    let (bot_tx, bot_rx) = tokio::sync::mpsc::unbounded_channel();
+    let bots = bot::BotEngine::from_config(&cfg.bot, bot_tx).context("invalid [[bot]] config")?;
+    let n_bots = cfg.bot.len();
+
     let handlers = Arc::new(PostHandlers {
         notifier: Notifier::new(),
         counters: StatusCounters::new(cfg.notifications.status_file.clone()),
+        bots,
     });
     let _ = handlers.counters.write();
+
+    let bot_handle = if n_bots > 0 {
+        let graph = graph.clone();
+        let stream = stream.clone();
+        Some(tokio::spawn(async move {
+            bot::run_bot_jobs(bot_rx, graph, stream).await;
+        }))
+    } else {
+        None
+    };
 
     let shutdown = Arc::new(AtomicBool::new(false));
     {
@@ -197,7 +216,12 @@ async fn run() -> Result<()> {
         });
     }
 
-    println!("teams-tui ready — following {n_chats} chats and {n_channels} channels");
+    let bots_note = if n_bots > 0 {
+        format!(", {n_bots} bots")
+    } else {
+        String::new()
+    };
+    println!("teams-tui ready — following {n_chats} chats and {n_channels} channels{bots_note}");
     handle_chats_list(&stream, &follow);
 
     let poll_msg_handle = {
@@ -248,6 +272,10 @@ async fn run() -> Result<()> {
     poll_disc_handle.abort();
     let _ = poll_msg_handle.await;
     let _ = poll_disc_handle.await;
+    if let Some(h) = bot_handle {
+        h.abort();
+        let _ = h.await;
+    }
 
     let cursors = follow.lock().unwrap().to_cursors();
     let _ = cursors.save_to(&cursors_path);

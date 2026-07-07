@@ -26,6 +26,26 @@ pub enum NotificationKind {
     Mention,
 }
 
+/// What `on_incoming` did with a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Outcome {
+    pub notification: NotificationKind,
+    /// True when the message was displayed as a *new* line (tag assigned) — i.e.
+    /// a fresh message from someone else, or from you on another Teams client.
+    /// False for edits, deletes, and our own echoes looping back through the
+    /// poll. This is the signal bots fire on, so a bot never sees its own reply.
+    pub fresh: bool,
+}
+
+impl Outcome {
+    fn quiet() -> Self {
+        Self {
+            notification: NotificationKind::None,
+            fresh: false,
+        }
+    }
+}
+
 pub struct IncomingEvent {
     pub conversation_key: ConversationKey,
     pub conversation: Conversation,
@@ -100,14 +120,17 @@ impl Stream {
         });
     }
 
-    pub fn on_incoming(&self, event: IncomingEvent) -> NotificationKind {
+    pub fn on_incoming(&self, event: IncomingEvent) -> Outcome {
         let mut inner = self.inner.lock().unwrap();
         prune_ring(&mut inner.ring);
 
         let is_self = event.sender_id == self.self_id;
         let prefix = prefix_for(&event.conversation);
 
-        let seen_list = inner.seen.entry(event.conversation_key.clone()).or_default();
+        let seen_list = inner
+            .seen
+            .entry(event.conversation_key.clone())
+            .or_default();
         let is_resend = seen_list.iter().any(|id| id == &event.message_id);
         if !is_resend {
             seen_list.push_back(event.message_id.clone());
@@ -118,35 +141,40 @@ impl Stream {
 
         if event.deleted {
             if is_self {
-                return NotificationKind::None;
+                return Outcome::quiet();
             }
             self.printer.print_line(&format!(
                 "[{} deleted a message in {prefix}]",
                 event.sender_name
             ));
-            return NotificationKind::None;
+            return Outcome::quiet();
         }
 
         let (plain, mention_via_html) = html_to_text(&event.body_html, &self.self_id);
 
         if is_resend {
             if is_self {
-                return NotificationKind::None;
+                return Outcome::quiet();
             }
             self.printer.print_line(&format!(
                 "[edit from {} in {prefix}]: {plain}",
                 event.sender_name
             ));
-            return NotificationKind::None;
+            return Outcome::quiet();
         }
 
+        // Our own echo looping back through the poll: drop it. This is what keeps
+        // a bot from seeing its own reply (and what keeps messages you type in
+        // teams-tui from firing bots — send from another client for that).
         if is_self {
             let hash = hash_body(&plain);
-            if let Some(pos) = inner.ring.iter().position(|e| {
-                e.conversation_key == event.conversation_key && e.body_hash == hash
-            }) {
+            if let Some(pos) = inner
+                .ring
+                .iter()
+                .position(|e| e.conversation_key == event.conversation_key && e.body_hash == hash)
+            {
                 inner.ring.remove(pos);
-                return NotificationKind::None;
+                return Outcome::quiet();
             }
         }
 
@@ -167,15 +195,22 @@ impl Stream {
         );
         self.printer.print_line(&line);
 
-        if is_self {
-            return NotificationKind::None;
-        }
-        let is_dm = matches!(event.conversation, Conversation::Dm);
-        let mentioned = event.graph_says_mentioned || mention_via_html;
-        if is_dm || mentioned {
+        // A freshly-displayed message. Bots fire on these (see `Outcome::fresh`),
+        // including ones you send from another Teams client, which are `is_self`
+        // but weren't echoed locally so they reach here rather than being deduped.
+        let notification = if is_self {
+            NotificationKind::None
+        } else if matches!(event.conversation, Conversation::Dm)
+            || event.graph_says_mentioned
+            || mention_via_html
+        {
             NotificationKind::Mention
         } else {
             NotificationKind::NewOther
+        };
+        Outcome {
+            notification,
+            fresh: true,
         }
     }
 
@@ -261,7 +296,11 @@ mod tests {
             graph_says_mentioned: false,
         });
         let lines = sink.lock().unwrap();
-        assert_eq!(lines.len(), 1, "expected only local echo line, got {lines:?}");
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected only local echo line, got {lines:?}"
+        );
         assert!(lines[0].starts_with("> DM:you: hello"));
     }
 
@@ -336,7 +375,7 @@ mod tests {
     #[test]
     fn dm_from_other_person_returns_mention_notification() {
         let (s, _sink) = mk("me");
-        let kind = s.on_incoming(IncomingEvent {
+        let outcome = s.on_incoming(IncomingEvent {
             conversation_key: dm_key(),
             conversation: Conversation::Dm,
             message_id: "m1".into(),
@@ -347,13 +386,14 @@ mod tests {
             deleted: false,
             graph_says_mentioned: false,
         });
-        assert_eq!(kind, NotificationKind::Mention);
+        assert_eq!(outcome.notification, NotificationKind::Mention);
+        assert!(outcome.fresh);
     }
 
     #[test]
     fn channel_without_mention_returns_new_other() {
         let (s, _sink) = mk("me");
-        let kind = s.on_incoming(IncomingEvent {
+        let outcome = s.on_incoming(IncomingEvent {
             conversation_key: chan_key(),
             conversation: chan_conv(),
             message_id: "m1".into(),
@@ -364,13 +404,14 @@ mod tests {
             deleted: false,
             graph_says_mentioned: false,
         });
-        assert_eq!(kind, NotificationKind::NewOther);
+        assert_eq!(outcome.notification, NotificationKind::NewOther);
+        assert!(outcome.fresh);
     }
 
     #[test]
     fn channel_with_at_mention_of_self_returns_mention() {
         let (s, _sink) = mk("me");
-        let kind = s.on_incoming(IncomingEvent {
+        let outcome = s.on_incoming(IncomingEvent {
             conversation_key: chan_key(),
             conversation: chan_conv(),
             message_id: "m1".into(),
@@ -381,7 +422,66 @@ mod tests {
             deleted: false,
             graph_says_mentioned: false,
         });
-        assert_eq!(kind, NotificationKind::Mention);
+        assert_eq!(outcome.notification, NotificationKind::Mention);
+        assert!(outcome.fresh);
+    }
+
+    fn self_msg(id: &str, body: &str) -> IncomingEvent {
+        IncomingEvent {
+            conversation_key: chan_key(),
+            conversation: chan_conv(),
+            message_id: id.into(),
+            sender_id: "me".into(),
+            sender_name: "Me".into(),
+            time_hhmm: "10:00".into(),
+            body_html: format!("<p>{body}</p>"),
+            deleted: false,
+            graph_says_mentioned: false,
+        }
+    }
+
+    #[test]
+    fn self_message_from_another_client_is_fresh() {
+        // Sent from the phone: never locally echoed, so it reaches the display
+        // path and is `fresh` — this is what lets it trigger a bot.
+        let (s, _sink) = mk("me");
+        let outcome = s.on_incoming(self_msg("m1", "!bot fortune"));
+        assert!(outcome.fresh, "a self message we didn't echo must be fresh");
+        assert_eq!(outcome.notification, NotificationKind::None);
+    }
+
+    #[test]
+    fn own_echo_looping_back_is_not_fresh() {
+        // A reply/bot-output we sent: echoed locally, so the poll's copy is
+        // deduped and NOT fresh — a bot must never re-trigger on its own output.
+        let (s, _sink) = mk("me");
+        s.send_local_echo(&chan_conv(), &chan_key(), "fortune output");
+        let outcome = s.on_incoming(self_msg("m1", "fortune output"));
+        assert!(!outcome.fresh, "our own echo must not be fresh");
+    }
+
+    #[test]
+    fn edits_and_deletes_are_not_fresh() {
+        let (s, _sink) = mk("me");
+        let first = s.on_incoming(IncomingEvent {
+            sender_id: "alice".into(),
+            sender_name: "Alice".into(),
+            ..self_msg("m1", "hi")
+        });
+        assert!(first.fresh);
+        let edit = s.on_incoming(IncomingEvent {
+            sender_id: "alice".into(),
+            sender_name: "Alice".into(),
+            ..self_msg("m1", "hi there")
+        });
+        assert!(!edit.fresh, "an edit is not a fresh message");
+        let del = s.on_incoming(IncomingEvent {
+            sender_id: "alice".into(),
+            sender_name: "Alice".into(),
+            deleted: true,
+            ..self_msg("m1", "")
+        });
+        assert!(!del.fresh, "a delete is not a fresh message");
     }
 
     #[test]
@@ -410,6 +510,10 @@ mod tests {
             graph_says_mentioned: false,
         });
         let lines = sink.lock().unwrap();
-        assert_eq!(lines.len(), 1, "expected only the initial message, got {lines:?}");
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected only the initial message, got {lines:?}"
+        );
     }
 }

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use chrono::DateTime;
 
+use crate::bot::{BotContext, BotEngine};
 use crate::cursors::{ConversationKey, Cursors};
 use crate::graph::{GraphClient, GraphError, GraphMessage, MessagesDelta};
 use crate::notify::{Notifier, StatusCounters};
@@ -19,6 +20,7 @@ use crate::stream::{IncomingEvent, NotificationKind, Stream};
 pub struct PostHandlers {
     pub notifier: Notifier,
     pub counters: StatusCounters,
+    pub bots: Option<BotEngine>,
 }
 
 pub const MESSAGE_POLL_INTERVAL: Duration = Duration::from_secs(15);
@@ -270,8 +272,7 @@ async fn poll_chat_once(
     let mut cursor = chat.cursor.clone();
     let is_bootstrap = cursor.is_none();
     let mut messages: Vec<GraphMessage> = Vec::new();
-    let request_start =
-        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let request_start = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     loop {
         let resp: MessagesDelta = graph
@@ -361,11 +362,28 @@ fn dispatch(
 ) {
     let sender_name = event.sender_name.clone();
     let body_html = event.body_html.clone();
-    let kind = stream.on_incoming(event);
+    let conversation_key = event.conversation_key.clone();
+    let outcome = stream.on_incoming(event);
     let Some(h) = handlers else {
         return;
     };
-    match kind {
+
+    // Hand freshly-displayed messages to the bots. `fresh` is false for edits,
+    // deletes, and our own echoes (a bot's reply loops back through the poll and
+    // is deduped), so a bot never re-triggers on its own output; it's true for
+    // messages you send from another Teams client, so those fire bots.
+    if let Some(bots) = &h.bots
+        && outcome.fresh
+    {
+        let (plain, _) = html_to_text(&body_html, self_id);
+        bots.on_message(&BotContext {
+            plaintext: &plain,
+            conversation: conv,
+            conversation_key: &conversation_key,
+        });
+    }
+
+    match outcome.notification {
         NotificationKind::Mention => {
             let (preview, _) = html_to_text(&body_html, self_id);
             let _ = h.notifier.notify(&prefix_for(conv), &sender_name, &preview);
@@ -391,9 +409,8 @@ pub async fn message_poll_tick(
 ) -> bool {
     let mut any_error = false;
 
-    let chat_list: Vec<ChatFollowInfo> = {
-        follow.lock().unwrap().chats.values().cloned().collect()
-    };
+    let chat_list: Vec<ChatFollowInfo> =
+        { follow.lock().unwrap().chats.values().cloned().collect() };
 
     for chat in &chat_list {
         match poll_chat_once(graph, chat, stream, self_id, handlers).await {
@@ -427,9 +444,8 @@ pub async fn message_poll_tick(
         }
     }
 
-    let channel_list: Vec<ChannelFollowInfo> = {
-        follow.lock().unwrap().channels.values().cloned().collect()
-    };
+    let channel_list: Vec<ChannelFollowInfo> =
+        { follow.lock().unwrap().channels.values().cloned().collect() };
 
     for ch in &channel_list {
         let key = (ch.team_id.clone(), ch.channel_id.clone());

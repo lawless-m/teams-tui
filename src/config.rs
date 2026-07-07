@@ -13,6 +13,39 @@ pub struct Config {
     #[serde(default)]
     pub follow: FollowConfig,
     pub notifications: NotificationsConfig,
+    /// `[[bot]]` entries: regex-triggered programs that reply into the stream.
+    #[serde(default)]
+    pub bot: Vec<BotConfig>,
+}
+
+fn default_timeout_secs() -> u64 {
+    10
+}
+
+/// One `[[bot]]` block. Currently only `kind = "exec"` is supported: when an
+/// incoming message matches `trigger`, `command` is run (regex capture groups
+/// appended as argv, the whole message piped to stdin) and its stdout is posted
+/// back into the same conversation.
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub struct BotConfig {
+    pub kind: String,
+    pub trigger: String,
+    pub command: Vec<String>,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Minimum seconds between firings of this bot in one conversation. 0 = none.
+    #[serde(default)]
+    pub cooldown_secs: u64,
+    /// Optional scope: only fire in this channel (by name, optionally team).
+    #[serde(default)]
+    pub only: Option<BotScope>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub struct BotScope {
+    pub channel: String,
+    #[serde(default)]
+    pub team: Option<String>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]

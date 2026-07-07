@@ -34,7 +34,37 @@ status_file = "~/.cache/teams-tui/status"
 # [[follow.channels]]
 # team = "Engineering"
 # channel = "general"
+
+# Optional: exec bots — when an incoming message matches `trigger`, run a
+# program and post its stdout back into that conversation (as you).
+# [[bot]]
+# kind = "exec"
+# trigger = "^!deploy (\\w+)"      # regex; capture groups become extra argv
+# command = ["/usr/local/bin/deploy"]
+# timeout_secs = 30                # kill the program after this long (default 10)
+# cooldown_secs = 5                # min seconds between firings per conversation
+# only = { channel = "ops" }       # optional: restrict to one channel
 ```
+
+### Exec bots
+
+Each `[[bot]]` watches every message you'd see in the stream. On a regex match,
+`command` runs with the regex capture groups appended as arguments and the whole
+message piped to **stdin**; its stdout is posted back into the same conversation.
+
+The message is passed as *data* — the command is an argv list, never run through
+a shell — so a crafted message can't inject a command. Output is capped at 8 KiB.
+
+**You can trigger your own bots from another Teams client.** Send `!bot fortune`
+from your phone or the desktop app and teams-tui will see it as a new message and
+fire the bot. A bot's *reply*, by contrast, is echoed locally, so when it loops
+back through the poll it's recognised as your own and dropped — that's what stops
+a program that echoes its trigger from looping. (For the same reason, typing the
+trigger directly in the teams-tui prompt won't fire it — send it from another
+client.) A per-conversation `cooldown_secs` bounds the rate if you want a backstop.
+
+Because bots post **as you**, treat the programs you wire up as things you're
+happy to run against attacker-controlled input from anyone who can message you.
 
 ### 3. Install
 
